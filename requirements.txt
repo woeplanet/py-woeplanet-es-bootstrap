@@ -1,0 +1,8 @@
+git+https://github.com/woeplanet/py-woeplanet-placetypes
+git+https://github.com/woeplanet/py-woeplanet-uri
+elasticsearch>=7.0.0,<8.0.0
+geojson-rewind==0.2.0
+pygeohash==1.2.0
+shapely==1.7.0
+Fiona==1.8.13.post1
+chevron==0.13.1
