@@ -1,0 +1,6 @@
+-r requirements.txt
+pylint>=2.8.3
+flake8>=4.0.1
+flake8-alphabetize>=0.0.17
+flake8-bugbear>=22.1.11
+yapf>=0.32.0

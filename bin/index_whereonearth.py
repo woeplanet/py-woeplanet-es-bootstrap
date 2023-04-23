@@ -1,38 +1,54 @@
 #!/usr/bin/env python
+"""
+Imports WhereOnEarth GeoJSON files into Elasticsearch
+"""
 
 import datetime
 import json
 import logging
 import os
-import pygeohash
-import shapely.geometry
 import sys
 import re
 
+from elasticsearch import Elasticsearch, NotFoundError, helpers
+import pygeohash
+import shapely.geometry
+
 from woeplanet.docs.placetypes import PlaceTypes
 
-from elasticsearch import Elasticsearch, NotFoundError, helpers
 
 class WhereOnEarthImporter(object):
-    def __init__(self, opts):
-        self.opts = opts
-        self.es = Elasticsearch([self.opts.es], timeout=30, max_retries=10, retry_on_timeout=True)
+    """
+    WhereOnEarth/WOEDB data to Elasticsearch indexer thing
+    """
+    def __init__(self, config):
+        self.config = config
+        self.esclient = Elasticsearch(
+            [self.config.es],
+            timeout=30,
+            max_retries=10,
+            retry_on_timeout=True
+        )
         self.version = 'whereonearth 0.x'
-        self.update_count = opts.batch_size
-        self.index = opts.index
-        self.placetypes = PlaceTypes(self.es)
+        self.update_count = config.batch_size
+        self.index = config.index
+        self.placetypes = PlaceTypes(self.esclient)
         self.source = None
         self.docs = []
         self.counter = 0
         self.version = '0.0.0'
         self.provider = None
 
-        ll = logging.getLogger('elasticsearch')
-        ll.setLevel(logging.ERROR)
+        logger = logging.getLogger('elasticsearch')
+        logger.setLevel(logging.ERROR)
 
     def index_geojson(self, path):
-        datadir = "%s/data" % path
-        logging.debug("Indexing %s" % datadir)
+        """
+        Index WhereOnEarth GeoJSON files
+        """
+
+        datadir = f'{path}/data'
+        logging.debug("Indexing %s", datadir)
 
         for root, _, files in os.walk(datadir):
             for file in files:
@@ -40,11 +56,14 @@ class WhereOnEarthImporter(object):
                     srcfile = os.path.join(root, file)
                     match = re.search(r'(whereonearth-[^/]*)', srcfile)
                     if not match:
-                        logging.warning('This file doesn\'t smell like WhereOnEarth GeoJSON: %s' % srcfile)
+                        logging.warning(
+                            'This file doesn\'t smell like WhereOnEarth GeoJSON: %s',
+                            srcfile
+                        )
                     else:
                         self.source = match.group(1)
-                        with open(srcfile) as fh:
-                            src = json.load(fh)
+                        with open(srcfile, encoding='UTF-8') as ifh:
+                            src = json.load(ifh)
 
                             if 'type' in src and src['type'] == 'Feature':
                                 self.index_feature(src, srcfile)
@@ -54,28 +73,32 @@ class WhereOnEarthImporter(object):
                                     self.index_feature(feature, srcfile)
 
                             else:
-                                logging.warning('This file doesn\t smell like GeoJSON: %s' % srcfile)
+                                logging.warning('This file doesn\t smell like GeoJSON: %s', srcfile)
 
-        if len(self.docs):
-            logging.info("places %s final counter @ %s" % (self.version, self.counter))
+        if self.docs:
+            logging.info("places %s final counter @ %s", self.version, self.counter)
             self.counter += len(self.docs)
             self._add(self.docs)
             self.docs = []
 
-        logging.info("Added %s GeoJSON features" % self.counter)
-        logging.info("Finished indexing %s" % datadir)
+        logging.info("Added %s GeoJSON features", self.counter)
+        logging.info("Finished indexing %s", datadir)
 
     def index_feature(self, feature, srcfile):
+        """
+        Index a GeoJSON Feature
+        """
+
         props = feature['properties']
         if 'woe:id' in props:
             woeid = props['woe:id']
         elif 'woeid' in props:
             woeid = props['woeid']
         else:
-            logging.warning('Can\'t work out woeid property: %s' % srcfile)
+            logging.warning('Can\'t work out woeid property: %s', srcfile)
             return
 
-        logging.debug('Handling %s' % woeid)
+        logging.debug('Handling %s', woeid)
 
         doc = self.woeify_properties(props, srcfile)
 
@@ -83,18 +106,30 @@ class WhereOnEarthImporter(object):
         if 'geometry' in feature:
             geom = shapely.geometry.shape(feature['geometry'])
             if geom.geom_type != 'MultiPolygon':
-                logging.debug('woeid %s geometry is %s (converting to MultiPolygon)' % (doc['woe:id'], geom.geom_type))
-                mapping = shapely.geometry.mapping(shapely.geometry.multipolygon.MultiPolygon([geom]))
+                logging.debug(
+                    'woeid %s geometry is %s (converting to MultiPolygon)',
+                    doc['woe:id'],
+                    geom.geom_type
+                )
+                mapping = shapely.geometry.mapping(
+                    shapely.geometry.multipolygon.MultiPolygon([geom])
+                )
             else:
                 mapping = shapely.geometry.mapping(geom)
 
             if not geom.is_valid:
-                logging.warning('woeid %s: invalid/self-intersecting geometry! Trying to clean ...' % woeid)
+                logging.warning(
+                    'woeid %s: invalid/self-intersecting geometry! Trying to clean ...',
+                    woeid
+                )
                 clean = geom.buffer(0)
                 if not clean.is_valid:
-                    logging.warning('woeid %s: post clean - invalid/self-intersecting geometry!' % woeid)
+                    logging.warning(
+                        'woeid %s: post clean - invalid/self-intersecting geometry!',
+                        woeid
+                    )
                 else:
-                    logging.info('woeid %s: cleaned geometry successfully' % woeid)
+                    logging.info('woeid %s: cleaned geometry successfully', woeid)
                     mapping = shapely.geometry.mapping(clean)
 
             doc['geometry'] = {
@@ -104,24 +139,29 @@ class WhereOnEarthImporter(object):
 
         doc = self.merge_doc(doc)
 
-        self.docs.append({
-            '_index': self.index,
-            '_id': woeid,
-            '_op_type': 'update',
-            'doc': doc,
-            'doc_as_upsert': True
-        })
+        self.docs.append(
+            {
+                '_index': self.index,
+                '_id': woeid,
+                '_op_type': 'update',
+                'doc': doc,
+                'doc_as_upsert': True
+            }
+        )
 
         if len(self.docs) == self.update_count:
-            logging.info("places %s counter @ %s" % (self.version, self.counter))
+            logging.info("places %s counter @ %s", self.version, self.counter)
             self.counter += len(self.docs)
             self._add(self.docs)
             self.docs = []
 
     def woeify_properties(self, properties, srcfile):
+        """
+        Convert WhereOnEarth properties to WoePlanet properties
+        """
         doc = {}
 
-        doc['meta:provider'] = '%s:%s' % (self.source, self.version)
+        doc['meta:provider'] = f'{self.source}:{self.version}'
 
         # whereonearth-airport
         # whereonearth-country:
@@ -131,13 +171,13 @@ class WhereOnEarthImporter(object):
         #   woeid -> woe:id
 
         woeid = properties.get('woe:id', None)
-        if woeid == None:
+        if woeid is None:
             woeid = properties.get('woeid', None)
             if woeid:
                 doc['woe:id'] = int(woeid)
                 properties.pop('woeid', None)
             else:
-                logging.warning('Can\'t work out woeid property: %s' % srcfile)
+                logging.warning('Can\'t work out woeid property: %s', srcfile)
                 return None
         else:
             doc['woe:id'] = int(woeid)
@@ -247,20 +287,26 @@ class WhereOnEarthImporter(object):
             doc['woe:max_latitude'] = doc['geom:max_latitude'] = float(swlat)
             properties.pop('sw_latitude', None)
 
-        if all (key in doc for key in ('geom:latitude', 'geom:longitude')):
-            doc['geom:centroid'] = [
-                doc['geom:longitude'],
-                doc['geom:latitude']
-            ]
+        if all(key in doc for key in ('geom:latitude', 'geom:longitude')):
+            doc['geom:centroid'] = [doc['geom:longitude'], doc['geom:latitude']]
             doc['geom:hash'] = pygeohash.encode(doc['geom:latitude'], doc['geom:longitude'])
             doc['woe:centroid'] = doc['geom:centroid']
             doc['woe:hash'] = doc['geom:hash']
 
-        if all (key in doc for key in ('geom:min_latitude', 'geom:min_longitude', 'geom:max_latitude', 'geom:max_longitude')):
-            if doc['geom:min_longitude'] != doc['geom:max_longitude'] and doc['geom:min_latitude'] != doc['geom:max_latitude']:
+        if all(
+            key in doc for key in
+            ('geom:min_latitude',
+             'geom:min_longitude',
+             'geom:max_latitude',
+             'geom:max_longitude')
+        ):
+            if doc['geom:min_longitude'] != doc['geom:max_longitude'] and doc[
+                'geom:min_latitude'] != doc['geom:max_latitude']:
                 doc['geom:bbox'] = [
-                    doc['geom:min_longitude'], doc['geom:min_latitude'],
-                    doc['geom:max_longitude'], doc['geom:max_latitude']
+                    doc['geom:min_longitude'],
+                    doc['geom:min_latitude'],
+                    doc['geom:max_longitude'],
+                    doc['geom:max_latitude']
                 ]
                 doc['woe:bbox'] = doc['geom:bbox']
 
@@ -272,10 +318,10 @@ class WhereOnEarthImporter(object):
         #   placetype -> woe:placetype, woe:placetype_name
         placetype = properties.get('placetype', None)
         if placetype:
-            pt = self.placetypes.by_name(placetype)
-            if pt:
-                doc['woe:placetype_name'] = pt['shortname']
-                doc['woe:placetype'] = pt['id']
+            placetype = self.placetypes.by_name(placetype)
+            if placetype:
+                doc['woe:placetype_name'] = placetype['shortname']
+                doc['woe:placetype'] = placetype['id']
                 properties.pop('placetype', None)
 
         # whereonearth-airport:
@@ -283,28 +329,28 @@ class WhereOnEarthImporter(object):
         # whereonearth-state:
         #   hierarchy - > woe:hierarchy
 
-        h = properties.get('hierarchy', None)
+        raw = properties.get('hierarchy', None)
         hierarchy = {}
-        if h:
-            for place in h:
+        if raw:
+            for place in raw:
                 match = re.search(r'^(woe):(.*)=([0-9]{1,})$', place)
                 if match:
-                    pt = match.group(2)
-                    id = int(match.group(3))
-                    if pt == 'planet':
-                        hierarchy['planet'] = id
-                    elif pt == 'country':
-                        hierarchy['country'] = id
-                    elif pt == 'continent':
-                        hierarchy['continent'] = id
-                    elif pt == 'county':
-                        hierarchy['county'] = id
-                    elif pt == 'state':
-                        hierarchy['state'] = id
-                    elif pt == 'continent':
-                        hierarchy['continent'] = id
-                    elif pt == 'localadmin':
-                        hierarchy['localadmin'] = id
+                    placetype = match.group(2)
+                    hierarchy_woeid = int(match.group(3))
+                    if placetype == 'planet':
+                        hierarchy['planet'] = hierarchy_woeid
+                    elif placetype == 'country':
+                        hierarchy['country'] = hierarchy_woeid
+                    elif placetype == 'continent':
+                        hierarchy['continent'] = hierarchy_woeid
+                    elif placetype == 'county':
+                        hierarchy['county'] = hierarchy_woeid
+                    elif placetype == 'state':
+                        hierarchy['state'] = hierarchy_woeid
+                    elif placetype == 'continent':
+                        hierarchy['continent'] = hierarchy_woeid
+                    elif placetype == 'localadmin':
+                        hierarchy['localadmin'] = hierarchy_woeid
             if hierarchy:
                 doc['woe:hierarchy'] = hierarchy
 
@@ -317,7 +363,7 @@ class WhereOnEarthImporter(object):
 
         for key in list(properties):
             if re.match(r'^alias_[A-Z]{3}_[A-Z]{1}$', key):
-                alias = 'woe:%s' % key
+                alias = f'woe:{key}'
                 doc[alias] = properties[key]
                 properties.pop(key, None)
 
@@ -344,14 +390,18 @@ class WhereOnEarthImporter(object):
         return doc
 
     def merge_doc(self, update):
+        """
+        Merge/index WhereOnEarth document into WoePlanet document
+        """
+
         woeid = update['woe:id']
         doc = self._get_by_woeid(woeid)
         if not doc:
-            raise Exception('Cannot find existing document for woeid:%s' % woeid)
+            raise Exception(f'Cannot find existing document for woeid:{woeid}')
 
-        logging.debug('DOC DUMP FOR %d' % woeid)
+        logging.debug('DOC DUMP FOR %d', woeid)
         for key, value in update.items():
-            logging.debug('%s -> %s' % (key, json.dumps(value)))
+            logging.debug('%s -> %s', key, json.dumps(value))
 
             if key == 'meta:provider':
                 if not value in doc[key]:
@@ -393,7 +443,7 @@ class WhereOnEarthImporter(object):
 
     def _get_by_woeid(self, woeid):
         try:
-            rsp = self.es.get(self.index, woeid)
+            rsp = self.esclient.get(self.index, woeid)
             if 'found' in rsp:
                 return rsp['_source']
             else:
@@ -401,17 +451,53 @@ class WhereOnEarthImporter(object):
 
         except NotFoundError as _:
             return None
-        
+
     def _add(self, docs):
-        helpers.bulk(self.es, docs, request_timeout=60)
+        helpers.bulk(self.esclient, docs, request_timeout=60)
         # pass
 
+
 def main():
-    parser = argparse.ArgumentParser(prog='index-whereonearth', description='Imports WhereOnEarth GeoJSON files into Elasticsearch')
-    parser.add_argument('-e', '--elasticsearch', dest='es', metavar='URL', help='your ES endpoint; default is localhost:9200', default='localhost:9200')
-    parser.add_argument('-i', '--index', dest='index', action='store_true', help='WoePlanet index name; default is woeplanet', default='woeplanet')
-    parser.add_argument('-v', '--verbose', dest='verbose', action='store_true', help='enable chatty logging; default is false', default=False)
-    parser.add_argument('-b', '--batch-size', dest='batch_size', type=int, help='set indexing batchsize; default is 10,000', default=10000)
+    """
+    Script main entry point
+    """
+
+    parser = argparse.ArgumentParser(
+        prog='index-whereonearth',
+        description='Imports WhereOnEarth GeoJSON files into Elasticsearch'
+    )
+    parser.add_argument(
+        '-e',
+        '--elasticsearch',
+        dest='es',
+        metavar='URL',
+        help='your ES endpoint; default is localhost:9200',
+        default='localhost:9200'
+    )
+    parser.add_argument(
+        '-i',
+        '--index',
+        dest='index',
+        action='store_true',
+        help='WoePlanet index name; default is woeplanet',
+        default='woeplanet'
+    )
+    parser.add_argument(
+        '-v',
+        '--verbose',
+        dest='verbose',
+        action='store_true',
+        help='enable chatty logging; default is false',
+        default=False
+    )
+    parser.add_argument(
+        '-b',
+        '--batch-size',
+        dest='batch_size',
+        type=int,
+        help='set indexing batchsize; default is 10,000',
+        default=10000
+    )
     parser.add_argument('paths', nargs='*')
 
     args = parser.parse_args()
@@ -428,8 +514,9 @@ def main():
         sys.exit()
 
     for path in args.paths:
-        logging.info("Processing %s" %path)
+        logging.info("Processing %s", path)
         woei.index_geojson(path)
+
 
 if __name__ == '__main__':
     import argparse
